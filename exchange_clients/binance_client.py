@@ -87,14 +87,17 @@ class BinanceClient:
         async with self.session.get(url, params=params, headers=headers) as r:
             return await r.json()
 
-    async def rest_post(self, path: str, params=None, weight=1):
+    async def rest_post(self, path: str, params=None, weight=1, signed=True):
         await self._rate_limit(weight)
         url = f"{self.rest_url}{path}"
-
-        params["timestamp"] = int(time.time() * 1000)
-        query = self._sign(params)
-        url = f"{url}?{query}"
         headers = {"X-MBX-APIKEY": self.api_key}
+
+        if signed:
+            if params is None:
+                params = {}
+            params["timestamp"] = int(time.time() * 1000)
+            query = self._sign(params)
+            url = f"{url}?{query}"
 
         async with self.session.post(url, headers=headers) as r:
             return await r.json()
@@ -105,7 +108,15 @@ class BinanceClient:
     #############################################
     async def start_user_stream(self):
         """Order fill eventleri almak için listenKey al."""
-        data = await self.rest_post("/api/v3/userDataStream", params={}, weight=1)
+        data = await self.rest_post("/api/v3/userDataStream", params={}, weight=1, signed=False)
+        print("DEBUG: UserDataStream response:", data)
+        
+        if "listenKey" not in data:
+            print(f"ERROR: listenKey not found in response. Full response: {data}")
+            if "code" in data:
+                print(f"API Error Code: {data.get('code')}, Message: {data.get('msg')}")
+            return
+        
         self.listen_key = data["listenKey"]
         self.streams.append(f"{self.listen_key}")
         print("UserData listenKey:", self.listen_key)
@@ -221,5 +232,11 @@ class BinanceClient:
     async def disconnect(self):
         self.running = False
         if self.ws:
-            await self.ws.close()
-        await self.session.close()
+            try:
+                await self.ws.close()
+            except Exception as e:
+                print(f"Warning: Error closing websocket: {e}")
+        try:
+            await self.session.close()
+        except Exception as e:
+            print(f"Warning: Error closing session: {e}")
