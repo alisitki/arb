@@ -8,6 +8,7 @@ import websockets
 from typing import Callable, Optional, Dict, Any
 
 
+
 class BinanceClient:
     def __init__(self, api_key: str, api_secret: str):
         self.api_key = api_key
@@ -29,7 +30,7 @@ class BinanceClient:
         # Heartbeat / metrics
         self.last_msg_ts = time.time()
         self.heartbeat_timeout = 45
-        self.latency_rtt = 0
+        self.latency_rtt = 0  # Latency in milliseconds
 
         # Orderbook
         self.orderbook = {"bids": [], "asks": []}
@@ -172,13 +173,16 @@ class BinanceClient:
                     self.last_msg_ts = time.time()
 
                     heartbeat = asyncio.create_task(self._heartbeat())
-                    latency_pinger = asyncio.create_task(self._latency_ping())
 
                     async for msg in ws:
                         ts = time.time()
                         data = json.loads(msg)
 
                         self.last_msg_ts = ts
+                        
+                        # Calculate latency from event timestamp
+                        self._calculate_latency(data, ts)
+                        
                         await on_message(data)
 
             except Exception as e:
@@ -187,19 +191,40 @@ class BinanceClient:
                 print("Reconnecting...")
 
 
+    def _calculate_latency(self, data: dict, receive_time: float):
+        """
+        Calculate latency from WebSocket event timestamp.
+        
+        Args:
+            data: WebSocket message data
+            receive_time: Time when message was received (seconds)
+        """
+        try:
+            # Multi-stream format: {"stream": "...", "data": {...}}
+            if "stream" in data and "data" in data:
+                payload = data["data"]
+                
+                # Extract event timestamp (E field) - in milliseconds
+                event_timestamp_ms = payload.get("E")
+                
+                if event_timestamp_ms:
+                    # Convert receive time to milliseconds
+                    receive_time_ms = receive_time * 1000
+                    
+                    # Calculate latency: now - event_timestamp
+                    self.latency_rtt = receive_time_ms - event_timestamp_ms
+                    
+        except Exception as e:
+            # Silently ignore latency calculation errors
+            pass
+
+
     async def _heartbeat(self):
         while self.running:
             await asyncio.sleep(5)
             if time.time() - self.last_msg_ts > self.heartbeat_timeout:
                 print("Heartbeat timeout! Reconnecting...")
                 await self._reconnect()
-
-    async def _latency_ping(self):
-        """WS mesaj timestamp'larından latency/Jitter ölç."""
-        while self.running:
-            await asyncio.sleep(1)
-            now = time.time()
-            self.latency_rtt = now - self.last_msg_ts
 
 
     async def _reconnect(self):
