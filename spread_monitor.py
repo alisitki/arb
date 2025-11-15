@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BTC/TRY Spread Monitor
-Monitors real-time price spread between Binance and BtcTurk for BTC/TRY pair.
+USDT/TRY Spread Monitor
+Monitors real-time price spread between Binance and BtcTurk for USDT/TRY pair.
 Logs data to console (with colors) and CSV file.
 Only reads data, no trading operations.
 """
@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -45,7 +46,7 @@ class Colors:
 
 
 class SpreadMonitor:
-    """Monitor and log spread between Binance and BtcTurk for BTC/TRY."""
+    """Monitor and log spread between Binance and BtcTurk for USDT/TRY."""
     
     def __init__(self, csv_filename: str = "spread_log.csv"):
         # Initialize clients
@@ -82,8 +83,10 @@ class SpreadMonitor:
                     'btcturk_ask',
                     'spread_try',
                     'spread_pct',
-                    'binance_latency_ms',
-                    'btcturk_latency_ms'
+                    'binance_event_latency_ms',
+                    'binance_rtt_latency_ms',
+                    'btcturk_event_latency_ms',
+                    'btcturk_rtt_latency_ms'
                 ])
             print(f"{Colors.OKGREEN}✓ Created CSV file: {self.csv_filename}{Colors.ENDC}")
         else:
@@ -102,8 +105,10 @@ class SpreadMonitor:
                     data['btcturk_ask'],
                     data['spread_try'],
                     data['spread_pct'],
-                    data['binance_latency_ms'],
-                    data['btcturk_latency_ms']
+                    data['binance_event_latency_ms'],
+                    data['binance_rtt_latency_ms'],
+                    data['btcturk_event_latency_ms'],
+                    data['btcturk_rtt_latency_ms']
                 ])
         except Exception as e:
             print(f"{Colors.FAIL}Error writing to CSV: {e}{Colors.ENDC}")
@@ -116,8 +121,29 @@ class SpreadMonitor:
                 stream = data["stream"]
                 payload = data["data"]
                 
-                # Check if it's the BTC/TRY bookTicker stream
-                if "btctry@bookTicker" in stream:
+                # Check for aggTrade stream (has event timestamp)
+                if "usdttry@aggTrade" in stream:
+                    trade_price = float(payload.get("p", 0))
+                    # Approximate bid/ask from last trade price (minimal spread)
+                    self.binance_bid = trade_price - 0.001  # Slight offset for bid
+                    self.binance_ask = trade_price + 0.001  # Slight offset for ask
+                    
+                    # Calculate event latency
+                    event_time_ms = payload.get("E")  # Event time in milliseconds
+                    if event_time_ms:
+                        recv_time_ms = time.time() * 1000
+                        latency_ms = recv_time_ms - event_time_ms
+                        
+                        # Update with EMA smoothing
+                        if 0 <= latency_ms <= 10000:  # Sanity check: 0-10 seconds
+                            if self.binance.latency_event > 0:
+                                alpha = 0.3
+                                self.binance.latency_event = alpha * latency_ms + (1 - alpha) * self.binance.latency_event
+                            else:
+                                self.binance.latency_event = latency_ms
+                
+                # Keep bookTicker support as fallback
+                elif "usdttry@bookTicker" in stream:
                     self.binance_bid = float(payload.get("b", 0))
                     self.binance_ask = float(payload.get("a", 0))
         except Exception as e:
@@ -125,13 +151,13 @@ class SpreadMonitor:
     
     async def setup_binance(self):
         """Setup Binance WebSocket connection."""
-        # Subscribe to BTC/TRY book ticker
-        self.binance.streams.append("btctry@bookTicker")
+        # Subscribe to USDT/TRY aggregate trades (has event timestamp)
+        self.binance.streams.append("usdttry@aggTrade")
         
         # Start WebSocket connection in background
         asyncio.create_task(self.binance.connect(self.on_binance_message))
         
-        print(f"{Colors.OKGREEN}✓ Binance WebSocket subscribed to BTCTRY{Colors.ENDC}")
+        print(f"{Colors.OKGREEN}✓ Binance WebSocket subscribed to USDTTRY{Colors.ENDC}")
     
     def on_btcturk_message(self, msg: dict):
         """Handle BtcTurk WebSocket messages."""
@@ -146,15 +172,16 @@ class SpreadMonitor:
         # Wait a bit for connection to establish
         await asyncio.sleep(2)
         
-        # Subscribe to BTCTRY orderbook (no underscore!)
-        await self.btcturk.subscribe_orderbook("BTCTRY")
+        # Subscribe to USDTTRY orderbook and trade (no underscore!)
+        await self.btcturk.subscribe_orderbook("USDTTRY")
+        await self.btcturk.subscribe_trade("USDTTRY")
         
-        print(f"{Colors.OKGREEN}✓ BtcTurk WebSocket subscribed to BTCTRY{Colors.ENDC}")
+        print(f"{Colors.OKGREEN}✓ BtcTurk WebSocket subscribed to USDTTRY{Colors.ENDC}")
     
     def get_btcturk_best_prices(self) -> tuple[Optional[float], Optional[float]]:
         """Get best bid/ask from BtcTurk orderbook."""
         try:
-            ob = self.btcturk.orderbooks.get("BTCTRY", {})
+            ob = self.btcturk.orderbooks.get("USDTTRY", {})
             bids = ob.get("bids", [])
             asks = ob.get("asks", [])
             
@@ -195,8 +222,13 @@ class SpreadMonitor:
         spread_try, spread_percent = self.calculate_spread()
         
         # Get latencies (already in milliseconds from clients)
-        binance_latency = round(self.binance.latency_rtt, 2) if hasattr(self.binance, 'latency_rtt') else None
-        btcturk_latency = round(self.btcturk.latency_rtt, 2) if hasattr(self.btcturk, 'latency_rtt') else None
+        # Binance: prefer event latency, fallback to RTT
+        binance_event_latency = round(self.binance.latency_event, 2) if hasattr(self.binance, 'latency_event') and self.binance.latency_event > 0 else None
+        binance_rtt_latency = round(self.binance.latency_rtt, 2) if hasattr(self.binance, 'latency_rtt') and self.binance.latency_rtt > 0 else None
+        
+        # BTCTurk: prefer event latency, fallback to RTT
+        btcturk_event_latency = round(self.btcturk.latency_event, 2) if hasattr(self.btcturk, 'latency_event') and self.btcturk.latency_event > 0 else None
+        btcturk_rtt_latency = round(self.btcturk.latency_rtt, 2) if hasattr(self.btcturk, 'latency_rtt') and self.btcturk.latency_rtt > 0 else None
         
         # Format prices (all in TRY)
         binance_bid_str = f"{self.binance_bid:.2f}" if self.binance_bid else "N/A"
@@ -223,8 +255,21 @@ class SpreadMonitor:
             spread_color = Colors.ENDC
         
         # Latency strings
-        binance_lat_str = f"{binance_latency}ms" if binance_latency is not None else "N/A"
-        btcturk_lat_str = f"{btcturk_latency}ms" if btcturk_latency is not None else "N/A"
+        # Binance: show event latency if available, otherwise RTT
+        if binance_event_latency is not None:
+            binance_lat_str = f"{binance_event_latency}ms"
+        elif binance_rtt_latency is not None:
+            binance_lat_str = f"{binance_rtt_latency}ms(rtt)"
+        else:
+            binance_lat_str = "N/A"
+        
+        # BTCTurk: show event latency if available, otherwise RTT
+        if btcturk_event_latency is not None:
+            btcturk_lat_str = f"{btcturk_event_latency}ms"
+        elif btcturk_rtt_latency is not None:
+            btcturk_lat_str = f"{btcturk_rtt_latency}ms(rtt)"
+        else:
+            btcturk_lat_str = "N/A"
         
         # Single line log (colored)
         log_line = (
@@ -247,8 +292,10 @@ class SpreadMonitor:
             'btcturk_ask': self.btcturk_ask if self.btcturk_ask is not None else '',
             'spread_try': spread_try if spread_try is not None else '',
             'spread_pct': spread_percent if spread_percent is not None else '',
-            'binance_latency_ms': binance_latency if binance_latency is not None else '',
-            'btcturk_latency_ms': btcturk_latency if btcturk_latency is not None else ''
+            'binance_event_latency_ms': binance_event_latency if binance_event_latency is not None else '',
+            'binance_rtt_latency_ms': binance_rtt_latency if binance_rtt_latency is not None else '',
+            'btcturk_event_latency_ms': btcturk_event_latency if btcturk_event_latency is not None else '',
+            'btcturk_rtt_latency_ms': btcturk_rtt_latency if btcturk_rtt_latency is not None else ''
         }
         
         # Write to CSV
@@ -267,7 +314,7 @@ class SpreadMonitor:
     async def start(self):
         """Start the spread monitor."""
         print(f"{Colors.HEADER}{'=' * 80}{Colors.ENDC}")
-        print(f"{Colors.HEADER}{Colors.BOLD}BTC/TRY Spread Monitor - Starting...{Colors.ENDC}")
+        print(f"{Colors.HEADER}{Colors.BOLD}USDT/TRY Spread Monitor - Starting...{Colors.ENDC}")
         print(f"{Colors.HEADER}{'=' * 80}{Colors.ENDC}")
         
         # Setup both exchanges

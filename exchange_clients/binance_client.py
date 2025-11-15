@@ -30,7 +30,11 @@ class BinanceClient:
         # Heartbeat / metrics
         self.last_msg_ts = time.time()
         self.heartbeat_timeout = 45
-        self.latency_rtt = 0  # Latency in milliseconds
+        self.latency_rtt = 0  # Ping-pong RTT in milliseconds
+        self.latency_event = 0  # Event timestamp latency in milliseconds
+        
+        # Background tasks
+        self._ping_task = None
 
         # Orderbook
         self.orderbook = {"bids": [], "asks": []}
@@ -172,16 +176,16 @@ class BinanceClient:
                     self.ws = ws
                     self.last_msg_ts = time.time()
 
+                    # Start background tasks
                     heartbeat = asyncio.create_task(self._heartbeat())
+                    if self._ping_task is None or self._ping_task.done():
+                        self._ping_task = asyncio.create_task(self._ping_loop())
 
                     async for msg in ws:
                         ts = time.time()
                         data = json.loads(msg)
 
                         self.last_msg_ts = ts
-                        
-                        # Calculate latency from event timestamp
-                        self._calculate_latency(data, ts)
                         
                         await on_message(data)
 
@@ -191,32 +195,36 @@ class BinanceClient:
                 print("Reconnecting...")
 
 
-    def _calculate_latency(self, data: dict, receive_time: float):
-        """
-        Calculate latency from WebSocket event timestamp.
+    async def _ping_loop(self):
+        """Send periodic pings to measure RTT latency."""
+        ping_interval = 5.0  # Send ping every 5 seconds
         
-        Args:
-            data: WebSocket message data
-            receive_time: Time when message was received (seconds)
-        """
-        try:
-            # Multi-stream format: {"stream": "...", "data": {...}}
-            if "stream" in data and "data" in data:
-                payload = data["data"]
+        while self.running:
+            try:
+                await asyncio.sleep(ping_interval)
                 
-                # Extract event timestamp (E field) - in milliseconds
-                event_timestamp_ms = payload.get("E")
+                if not self.ws:
+                    continue
                 
-                if event_timestamp_ms:
-                    # Convert receive time to milliseconds
-                    receive_time_ms = receive_time * 1000
-                    
-                    # Calculate latency: now - event_timestamp
-                    self.latency_rtt = receive_time_ms - event_timestamp_ms
-                    
-        except Exception as e:
-            # Silently ignore latency calculation errors
-            pass
+                # Measure RTT using WebSocket ping frame
+                start_time = time.time()
+                pong_waiter = await self.ws.ping()
+                await asyncio.wait_for(pong_waiter, timeout=5.0)
+                rtt_ms = (time.time() - start_time) * 1000
+                
+                # Update latency with EMA (Exponential Moving Average)
+                alpha = 0.3  # Smoothing factor
+                if self.latency_rtt == 0:
+                    self.latency_rtt = rtt_ms
+                else:
+                    self.latency_rtt = alpha * rtt_ms + (1 - alpha) * self.latency_rtt
+                
+            except asyncio.TimeoutError:
+                pass  # Ping timeout, skip this measurement
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                pass  # Ignore other errors
 
 
     async def _heartbeat(self):
@@ -256,6 +264,15 @@ class BinanceClient:
     #############################################
     async def disconnect(self):
         self.running = False
+        
+        # Cancel ping task
+        if self._ping_task and not self._ping_task.done():
+            self._ping_task.cancel()
+            try:
+                await self._ping_task
+            except asyncio.CancelledError:
+                pass
+        
         if self.ws:
             try:
                 await self.ws.close()

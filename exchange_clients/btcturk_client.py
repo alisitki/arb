@@ -100,7 +100,8 @@ class BtcturkClient:
         
         # Monitoring
         self.last_msg_ts = 0.0
-        self.latency_rtt = 0.0  # Latency in milliseconds
+        self.latency_rtt = 0.0  # Ping-pong RTT in milliseconds
+        self.latency_event = 0.0  # Event timestamp latency in milliseconds
         
         # Subscriptions (to restore on reconnect)
         self.subscriptions: List[Dict[str, Any]] = []
@@ -110,7 +111,7 @@ class BtcturkClient:
         
         # Background tasks
         self._heartbeat_task: Optional[asyncio.Task] = None
-        self._latency_task: Optional[asyncio.Task] = None
+        self._ping_task: Optional[asyncio.Task] = None
         
         # Nonce counter for WS authentication (start from a higher number)
         self._ws_nonce = 3000
@@ -150,8 +151,8 @@ class BtcturkClient:
         # Start background tasks
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(self._heartbeat_task_loop())
-        if self._latency_task is None or self._latency_task.done():
-            self._latency_task = asyncio.create_task(self._latency_task_loop())
+        if self._ping_task is None or self._ping_task.done():
+            self._ping_task = asyncio.create_task(self._ping_task_loop())
         
         retry_delay = 1.0
         max_retry_delay = 60.0
@@ -184,9 +185,6 @@ class BtcturkClient:
                         
                         try:
                             msg = json.loads(raw_msg)
-                            
-                            # Calculate latency from event timestamp
-                            self._calculate_latency(msg, receive_time)
                             
                             # Handle message internally
                             await self._handle_message(msg)
@@ -234,10 +232,10 @@ class BtcturkClient:
             except asyncio.CancelledError:
                 pass
         
-        if self._latency_task and not self._latency_task.done():
-            self._latency_task.cancel()
+        if self._ping_task and not self._ping_task.done():
+            self._ping_task.cancel()
             try:
-                await self._latency_task
+                await self._ping_task
             except asyncio.CancelledError:
                 pass
         
@@ -297,74 +295,71 @@ class BtcturkClient:
             except Exception as e:
                 logger.error(f"Error in heartbeat task: {e}")
     
-    async def _latency_task_loop(self):
-        """Calculate latency metric (deprecated - now calculated per message)."""
-        # This task is kept for backward compatibility but latency is now
-        # calculated directly from event timestamps in _calculate_latency()
+    async def _ping_task_loop(self):
+        """Send periodic pings to measure RTT latency."""
+        ping_interval = 5.0  # Send ping every 5 seconds
+        
         while self.running:
             try:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(ping_interval)
+                
+                if not self.ws:
+                    continue
+                
+                # Use WebSocket native ping frame for RTT measurement
+                start_time = time.time()
+                pong_waiter = await self.ws.ping()
+                await asyncio.wait_for(pong_waiter, timeout=5.0)
+                rtt_ms = (time.time() - start_time) * 1000
+                
+                # Update latency with EMA (Exponential Moving Average)
+                alpha = 0.3  # Smoothing factor
+                if self.latency_rtt == 0:
+                    self.latency_rtt = rtt_ms
+                else:
+                    self.latency_rtt = alpha * rtt_ms + (1 - alpha) * self.latency_rtt
+                
+                logger.debug(f"BTCTurk WebSocket ping RTT: {rtt_ms:.1f}ms (smoothed={self.latency_rtt:.1f}ms)")
             
+            except asyncio.TimeoutError:
+                logger.debug("BTCTurk ping timeout")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in latency task: {e}")
+                logger.debug(f"BTCTurk ping error: {e}")
     
-    def _calculate_latency(self, msg: Any, receive_time: float):
+    def _calculate_latency(self, event_timestamp_ms: float):
         """
         Calculate latency from WebSocket event timestamp.
         
         Args:
-            msg: WebSocket message (format: [code, payload])
-            receive_time: Time when message was received (seconds)
+            event_timestamp_ms: Event timestamp in milliseconds (Unix time)
         """
         try:
-            if not isinstance(msg, list) or len(msg) < 2:
+            # Sanity check: reasonable timestamp (after year 2001)
+            if not event_timestamp_ms or event_timestamp_ms < 1000000000000:
                 return
             
-            code = msg[0]
-            payload = msg[1] if len(msg) > 1 else {}
+            # Get current time in milliseconds
+            current_time_ms = time.time() * 1000
             
-            # Extract timestamp based on message type
-            event_timestamp_ms = None
+            # Calculate latency: now - event_timestamp
+            # Use abs() because clock skew can make event timestamp slightly in future
+            latency = abs(current_time_ms - event_timestamp_ms)
             
-            # Orderbook messages (431=full, 432=diff) - use CS (Change Sequence) or D (Date)
-            if code in (431, 432):
-                # Try CS (change sequence timestamp) first, then D (date)
-                event_timestamp_ms = payload.get("CS") or payload.get("D")
+            # Only update if latency is reasonable (0-10000ms = 0-10 seconds)
+            if 0 <= latency <= 10000:
+                # Apply EMA smoothing if we already have a value
+                if self.latency_event > 0:
+                    alpha = 0.3
+                    self.latency_event = alpha * latency + (1 - alpha) * self.latency_event
+                else:
+                    self.latency_event = latency
                 
-                # DEBUG: Log first few messages to understand timestamp format
-                if not hasattr(self, '_debug_count'):
-                    self._debug_count = 0
-                if self._debug_count < 3:
-                    logger.info(f"DEBUG Orderbook {code}: CS={payload.get('CS')}, D={payload.get('D')}, receive_time={receive_time}, receive_time_ms={receive_time*1000}")
-                    self._debug_count += 1
-            
-            # Trade messages (422=single trade, 423=user trade)
-            elif code in (422, 423):
-                # Trade messages have "D" field for timestamp
-                event_timestamp_ms = payload.get("D")
-            
-            # Ticker messages (401, 402)
-            elif code in (401, 402):
-                # Ticker may have timestamp field
-                event_timestamp_ms = payload.get("D") or payload.get("timestamp")
-            
-            # User order events (441, 451, 452, 453)
-            elif code in (441, 451, 452, 453):
-                # User events have timestamp field
-                event_timestamp_ms = payload.get("timestamp")
-            
-            # Calculate latency if we have an event timestamp
-            if event_timestamp_ms:
-                # Convert receive time to milliseconds
-                receive_time_ms = receive_time * 1000
-                
-                # Calculate latency: now - event_timestamp
-                self.latency_rtt = receive_time_ms - event_timestamp_ms
-                
+                logger.debug(f"BTCTurk event latency: {latency:.2f}ms (smoothed: {self.latency_event:.2f}ms)")
+        
         except Exception as e:
-            # Silently ignore latency calculation errors
+            logger.error(f"Latency calculation error: {e}")
             pass
     
     # =========================================================================
@@ -451,7 +446,7 @@ class BtcturkClient:
             asks.sort()
             
             self.orderbooks[pair] = {"bids": bids, "asks": asks}
-            logger.info(
+            logger.debug(
                 f"Orderbook full for {pair}: "
                 f"{len(bids)} bids, {len(asks)} asks"
             )
@@ -510,10 +505,16 @@ class BtcturkClient:
             price = payload.get("P")
             amount = payload.get("A")
             side = payload.get("S")  # 0=buy, 1=sell
+            trade_timestamp = payload.get("D")  # Unix timestamp in milliseconds
             
-            logger.debug(
-                f"Trade {pair}: {side} {amount} @ {price}"
-            )
+            # Calculate event latency if timestamp available
+            if trade_timestamp:
+                # Convert to float if it's a string
+                ts_ms = float(trade_timestamp) if isinstance(trade_timestamp, str) else trade_timestamp
+                self._calculate_latency(ts_ms)
+                logger.debug(
+                    f"Trade {pair}: {side} {amount} @ {price} (event latency={self.latency_event:.2f}ms)"
+                )
         
         except Exception as e:
             logger.error(f"Error handling trade: {e}")
